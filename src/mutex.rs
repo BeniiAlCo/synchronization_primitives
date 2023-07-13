@@ -41,7 +41,7 @@ impl<T> Mutex<T> {
     pub fn lock(&self) -> MutexGuard<T> {
         MutexGuard {
             mutex: self,
-            permit: self.semaphore.wait(),
+            permit: self.semaphore.aquire(),
         }
     }
 
