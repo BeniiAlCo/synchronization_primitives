@@ -1,1 +1,1 @@
-mod binary_semaphore;
+pub mod binary_semaphore;
