@@ -1,6 +1,7 @@
-use std::sync::atomic::Ordering::Acquire;
-use std::sync::atomic::{AtomicPtr, Ordering::Relaxed};
-use std::time::Duration;
+use std::{
+    ptr,
+    sync::atomic::{AtomicPtr, Ordering::Relaxed},
+};
 
 /// RCU: **R**ead, **C**opy, **U**pdate; A Pattern for Concurrent Access to large Structs
 ///
@@ -33,55 +34,134 @@ use std::time::Duration;
 /// at t=3, Thread 1 Replaces the data in the RCU and drops the original RCU data. Thread 2 still
 /// has a reference to the original data, that Thread 1 does not know about. We have dropped data
 /// that we still have a reference to. This is an error.
-pub struct Rcu {
-    ptr: AtomicPtr<Vec<i32>>,
+pub struct List<T> {
+    head: AtomicPtr<Node<T>>, //*mut Node<T>,
+                              //tail: AtomicPtr<Node<T>>, //*mut Node<T>,
 }
 
-impl Default for Rcu {
+struct Node<T> {
+    elem: T,
+    next: *mut Node<T>,
+}
+
+impl<T> Default for List<T> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl Rcu {
-    pub fn new() -> Rcu {
-        Rcu {
-            ptr: AtomicPtr::new(Box::into_raw(Box::default())),
+impl<T> List<T> {
+    pub fn new() -> Self {
+        Self {
+            head: AtomicPtr::new(ptr::null_mut()),
+            //tail: AtomicPtr::new(ptr::null_mut()),
         }
     }
 
-    pub fn push(&self, elem: i32) {
+    pub fn push(&self, elem: T) {
+        let mut new_head = Box::new(Node {
+            elem,
+            next: ptr::null_mut(),
+        });
+        let current_head = self.head.load(Relaxed);
+
+        let new_head = if current_head.is_null() {
+            Box::into_raw(new_head)
+        } else {
+            new_head.next = current_head;
+            Box::into_raw(new_head)
+        };
+
+        if self
+            .head
+            .compare_exchange(
+                current_head,
+                new_head,
+                std::sync::atomic::Ordering::Acquire,
+                Relaxed,
+            )
+            .is_ok()
+        {
+        } else {
+            unsafe {
+                drop(Box::from_raw(new_head));
+            }
+        }
+    }
+
+    pub fn pop(&self) -> Option<T> {
         unsafe {
-            // Read
-            let old = self.ptr.load(Relaxed);
-
-            // Copy
-            let mut new = Box::new((*old).clone());
-
-            // Modify
-            (*new).push(elem);
-            let new = Box::into_raw(new);
-            std::thread::sleep(Duration::from_secs(1));
-
-            match self.ptr.compare_exchange(old, new, Acquire, Relaxed) {
-                Ok(old) => {
-                    drop(Box::from_raw(old));
+            let current_head = self.head.load(Relaxed);
+            if current_head.is_null() {
+                None
+            } else {
+                let old_head = Box::from_raw(current_head);
+                let new_head = old_head.next;
+                if self
+                    .head
+                    .compare_exchange(
+                        current_head,
+                        new_head,
+                        std::sync::atomic::Ordering::Acquire,
+                        Relaxed,
+                    )
+                    .is_ok()
+                {
+                    Some(old_head.elem)
+                } else {
+                    None
                 }
-                Err(_) => drop(Box::from_raw(new)),
             }
         }
     }
 }
 
+impl<T: std::fmt::Debug + Clone> std::fmt::Debug for List<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        unsafe {
+            let mut v = vec![];
+            let mut current = self.head.load(Relaxed);
+            while !current.is_null() {
+                v.push((*current).elem.clone());
+                current = (*current).next; //.load(Relaxed);
+            }
+            f.debug_struct("List").field("head", &v).finish()
+        }
+    }
+}
+
+impl<T> Drop for List<T> {
+    fn drop(&mut self) {
+        while self.pop().is_some() {}
+    }
+}
+
 #[test]
-fn rcu_test() {
-    let q = std::sync::Arc::new(Rcu::new());
+fn rcu_() {
+    let q = List::new();
+    q.push(1);
+    q.push(2);
+    dbg!(q);
+}
+
+#[test]
+fn rcu() {
+    let q = std::sync::Arc::new(List::new());
     std::thread::scope(|s| {
         for _ in 0..3 {
             s.spawn(|| {
                 let q = q.clone();
                 q.push(1);
             });
+            s.spawn(|| {
+                let q = q.clone();
+                q.push(2);
+            });
+            s.spawn(|| {
+                let q = q.clone();
+                q.pop();
+            });
         }
     });
+    dbg!(q);
 }
