@@ -1,6 +1,6 @@
 // Mutex that is a single AtomicPtr that points to a list of waiting threads.
 
-use std::{collections::VecDeque, sync::atomic::AtomicPtr, thread, time::Duration};
+use std::{collections::VecDeque, sync::atomic::AtomicPtr};
 
 pub struct QueueLock {
     ptr: AtomicPtr<VecDeque<i32>>,
@@ -55,6 +55,7 @@ fn another_test() {
             q.add(2);
         });
     });
+
     std::thread::scope(|s| {
         s.spawn(|| {
             let q = q.clone();

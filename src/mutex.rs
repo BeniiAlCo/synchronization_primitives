@@ -75,6 +75,7 @@ mod tests {
     #[test]
     fn test_mutex_concurrency() {
         const NUM_THREADS: usize = 10;
+
         const NUM_ITERATIONS: usize = 1000;
 
         let mutex = Arc::new(Mutex::new(0));
