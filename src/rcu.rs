@@ -1,47 +1,22 @@
+use crate::{
+    semaphore::binary_semaphore::BinarySemaphore,
+    sync::atomic::{AtomicPtr, AtomicUsize},
+};
 use std::{
-    ptr,
-    sync::atomic::{AtomicPtr, Ordering::Relaxed},
+    ptr::null_mut,
+    sync::atomic::Ordering::{Acquire, Relaxed, Release},
 };
 
-/// RCU: **R**ead, **C**opy, **U**pdate; A Pattern for Concurrent Access to large Structs
-///
-/// # An Overview
-///
-/// We can use existing synchronization primatives to safely access small variables concurrently.
-/// If the variable were to be much larger, however, we don't have an atomic type that allows for
-/// lock-free atomic operations on the entire object.
-/// RCU is a process that allows for this kind of interaction.
-///
-/// RCU is a pattern in which we take a(n atomic) pointer to an object.
-/// From here, a given thread can read in the object, make changes, then replace the entire object
-/// atomically (give there have been no changes since it was read).
-///
-/// # The Plan
-///
-/// 1. **R**ead the data
-/// 2. **C**opy the data to a new (not-concurrently-accessible) location
-/// 3. Modify that data if necessary
-/// 4. **U**pdate the data by swapping the new data with the old data (if the old data hasn't already
-///    been updated by some other thread in the meantime)
-/// 5. Deallocate the old data
-///
-/// # The Problem
-///
-/// At t=1, Thread 1 Reads the data protected by the RCU, and modifies it. Even though it copies
-/// the data into a local variable to modify it, it still must keep a version of the original data,
-/// as to compare to the RCU data when it tries to update it.
-/// At t=2, Thread 2 Reads the data protected by the RCU, and modifies it.
-/// at t=3, Thread 1 Replaces the data in the RCU and drops the original RCU data. Thread 2 still
-/// has a reference to the original data, that Thread 1 does not know about. We have dropped data
-/// that we still have a reference to. This is an error.
 pub struct List<T> {
-    head: AtomicPtr<Node<T>>, //*mut Node<T>,
-                              //tail: AtomicPtr<Node<T>>, //*mut Node<T>,
+    head: AtomicPtr<Node<T>>,
+    tail: AtomicPtr<Node<T>>,
+    len: AtomicUsize,
+    semaphore: BinarySemaphore,
 }
 
 struct Node<T> {
     elem: T,
-    next: *mut Node<T>,
+    next: AtomicPtr<Node<T>>,
 }
 
 impl<T> Default for List<T> {
@@ -50,118 +25,231 @@ impl<T> Default for List<T> {
     }
 }
 
+unsafe impl<T> Sync for List<T> {}
+
 impl<T> List<T> {
     pub fn new() -> Self {
         Self {
-            head: AtomicPtr::new(ptr::null_mut()),
-            //tail: AtomicPtr::new(ptr::null_mut()),
+            head: AtomicPtr::new(null_mut()),
+            tail: AtomicPtr::new(null_mut()),
+            len: AtomicUsize::new(0),
+            semaphore: BinarySemaphore::new(),
         }
     }
 
-    pub fn push(&self, elem: T) {
+    pub fn len(&self) -> usize {
+        self.len.load(Relaxed)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn push_front(&self, elem: T) {
+        let permit = self.semaphore.aquire();
         let mut new_head = Box::new(Node {
             elem,
-            next: ptr::null_mut(),
+            next: AtomicPtr::new(null_mut()),
         });
-        let current_head = self.head.load(Relaxed);
-
-        let new_head = if current_head.is_null() {
-            Box::into_raw(new_head)
-        } else {
-            new_head.next = current_head;
-            Box::into_raw(new_head)
-        };
-
-        if self
-            .head
-            .compare_exchange(
-                current_head,
-                new_head,
-                std::sync::atomic::Ordering::Acquire,
-                Relaxed,
-            )
-            .is_ok()
-        {
-        } else {
-            unsafe {
-                drop(Box::from_raw(new_head));
+        let mut current_head = self.head.load(Relaxed);
+        let mut current_tail = self.tail.load(Relaxed);
+        //loop {
+        unsafe {
+            if current_head.is_null() {
+                //if !current_tail.is_null() {
+                // if head is null and tail is not null, a thread is in the middle of
+                // `push_tail`, and we should assume that there is a head that hasn't been
+                // updated yet, so we know this attempt at replacing the head will fail
+                //continue;
+                //}
+                // Head is null
+                // If the tail is also null, then we can proceed
+                // but we should also enter a binary semaphore here, as if we are changing the
+                // head atomically, we cannot guaruntee that no other thread won't change the
+                // tail while we do that... but is that a problem?
+                // What if the tail is null here, but when we update the head, the tail is not
+                // null?
+                // We could say, if the head is null, the tail ought be null, if that's not the
+                // case, then restart the loop as the head is about to be updated to be the
+                // tail
+                // if the tail is null, then we swap in the new head, and if the head's swap
+                // has been successful, we then check the tail again, and if it is still null,
+                // then we're good, and the tail should be set to the head, and if it isn't,
+                // the head's next needs to be set to the tail
+            } else {
+                new_head.next = AtomicPtr::new(current_head);
             }
+            let x = Box::into_raw(new_head);
+
+            self.head.store(x, Relaxed);
+            //match self
+            //    .head
+            //    .compare_exchange(current_head, x, Acquire, Relaxed)
+            //{
+            //    Ok(old_head) => {
+            self.len.fetch_add(1, Relaxed);
+            // the head is now irreversibly in place -- if the head was null when we
+            // started, and the tail is still null, then we want to update the tail to
+            // be the same as the head;
+            // if the head was null and the tail is now not null, then it was up to the
+            // `push_tail` call to update any `Node` `next` fields, so we don't need to
+            // do any additional bookkeeping.
+            //if old_head.is_null() {
+            //    let _ = self.tail.compare_exchange(
+            //        current_tail,
+            //        self.head.load(Acquire),
+            //        Acquire,
+            //        Relaxed,
+            //    );
+            //}
+            //break;
+            //    }
+            //    Err(_e) => {
+            //new_head = Box::from_raw(x);
+            //current_head = self.head.load(Relaxed);
+            //    }
+            //}
         }
+        //}
+        BinarySemaphore::release(permit);
     }
 
-    pub fn pop(&self) -> Option<T> {
+    pub fn pop_front(&self) -> Option<T> {
+        let permit = self.semaphore.aquire();
         unsafe {
             let current_head = self.head.load(Relaxed);
+            let current_tail = self.tail.load(Relaxed);
             if current_head.is_null() {
                 None
             } else {
                 let old_head = Box::from_raw(current_head);
-                let new_head = old_head.next;
-                if self
-                    .head
-                    .compare_exchange(
-                        current_head,
-                        new_head,
-                        std::sync::atomic::Ordering::Acquire,
-                        Relaxed,
-                    )
-                    .is_ok()
-                {
-                    Some(old_head.elem)
-                } else {
-                    None
-                }
+                let new_head = old_head.next.load(Relaxed);
+                self.head.store(new_head, Relaxed);
+                //if self
+                //    .head
+                //    .compare_exchange(current_head, new_head, Acquire, Relaxed)
+                //    .is_ok()
+                //{
+                self.len.fetch_sub(1, Release);
+                BinarySemaphore::release(permit);
+                Some(old_head.elem)
+                //} else {
+                //    BinarySemaphore::release(permit);
+                //    None
+                //}
             }
-        }
-    }
-}
-
-impl<T: std::fmt::Debug + Clone> std::fmt::Debug for List<T> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        unsafe {
-            let mut v = vec![];
-            let mut current = self.head.load(Relaxed);
-            while !current.is_null() {
-                v.push((*current).elem.clone());
-                current = (*current).next; //.load(Relaxed);
-            }
-            f.debug_struct("List").field("head", &v).finish()
         }
     }
 }
 
 impl<T> Drop for List<T> {
     fn drop(&mut self) {
-        while self.pop().is_some() {}
+        while self.pop_front().is_some() {}
     }
 }
 
-#[test]
-fn rcu_() {
-    let q = List::new();
-    q.push(1);
-    q.push(2);
-    dbg!(q);
+impl<T: std::fmt::Debug> std::fmt::Debug for List<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        unsafe {
+            let mut v = vec![];
+            let mut current = self.head.load(Relaxed);
+            while !current.is_null() {
+                v.push(format!("{:?}", (*current).elem));
+                current = (*current).next.load(Relaxed);
+            }
+            f.debug_struct("List")
+                .field("head", &v)
+                .field("len", &v.len())
+                .finish()
+        }
+    }
 }
 
-#[test]
-fn rcu() {
-    let q = std::sync::Arc::new(List::new());
-    std::thread::scope(|s| {
-        for _ in 0..3 {
-            s.spawn(|| {
-                let q = q.clone();
-                q.push(1);
-            });
-            s.spawn(|| {
-                let q = q.clone();
-                q.push(2);
-            });
-            s.spawn(|| {
-                let q = q.clone();
-                q.pop();
+#[cfg(test)]
+mod tests {
+    use super::List;
+
+    #[cfg(not(loom))]
+    mod sequential {
+        use super::*;
+
+        #[test]
+        fn push_and_drop() {
+            let list = List::new();
+            list.push_front(1);
+            list.push_front(2);
+            dbg!(&list);
+            drop(list);
+        }
+
+        #[test]
+        fn push_and_pop() {
+            let list = List::new();
+            list.push_front(1);
+            list.pop_front();
+        }
+    }
+
+    mod concurrent {
+        use crate::{sync::Arc, thread};
+
+        use super::*;
+
+        #[test]
+        fn push_from_multiple_threads() {
+            loom::model(|| {
+                const NUM_THREADS: usize = 2;
+
+                let list = Arc::new(List::new());
+
+                let mut handles = Vec::with_capacity(NUM_THREADS);
+
+                for i in 0..NUM_THREADS {
+                    let list = list.clone();
+
+                    let handle = thread::spawn(move || {
+                        list.push_front(thread::current().id());
+                        assert_ne!(0, list.len());
+                    });
+                    handles.push(handle);
+                }
+
+                for handle in handles {
+                    handle.join().unwrap();
+                }
+
+                assert_eq!(NUM_THREADS, list.len());
             });
         }
-    });
-    dbg!(q);
+
+        #[test]
+        fn push_and_pop_from_multiple_threads() {
+            loom::model(|| {
+                const NUM_THREADS: usize = 2;
+
+                let list = Arc::new(List::new());
+
+                let mut handles = Vec::with_capacity(NUM_THREADS);
+
+                let l = list.clone();
+                let handle = thread::spawn(move || {
+                    l.push_front(thread::current().id());
+                    //assert_ne!(0, l.len());
+                });
+                handles.push(handle);
+
+                let l = list.clone();
+                let handle = thread::spawn(move || {
+                    l.pop_front();
+                });
+                handles.push(handle);
+
+                for handle in handles {
+                    handle.join().unwrap();
+                }
+
+                assert_eq!(1, list.len());
+            });
+        }
+    }
 }

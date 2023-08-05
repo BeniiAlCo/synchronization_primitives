@@ -49,6 +49,7 @@ fn lock_contended(state: &AtomicU32) {
     while state.load(Relaxed) == 1 && spin_count < 100 {
         spin_count += 1;
         std::hint::spin_loop();
+        loom::hint::spin_loop();
     }
 
     if state.compare_exchange(2, 1, Acquire, Relaxed).is_ok() {
