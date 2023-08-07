@@ -1,125 +1,210 @@
-// Mutex that is a single AtomicPtr that points to a list of waiting threads.
+use crate::sync::atomic::{
+    AtomicPtr,
+    Ordering::{Acquire, Relaxed},
+};
+use std::ptr::{null_mut, NonNull};
 
-use std::{collections::VecDeque, sync::atomic::AtomicPtr};
-
-pub struct QueueLock {
-    ptr: AtomicPtr<VecDeque<i32>>,
+pub struct Queue<T> {
+    head: AtomicPtr<Node<T>>,
+    tail: AtomicPtr<Node<T>>,
 }
 
-impl QueueLock {
-    fn new() -> Self {
+struct Node<T> {
+    elem: T,
+    next: Option<NonNull<Node<T>>>,
+}
+
+impl<T> Queue<T> {
+    pub fn new() -> Self {
         Self {
-            ptr: AtomicPtr::new(Box::into_raw(Box::default())),
+            head: AtomicPtr::new(null_mut()),
+            tail: AtomicPtr::new(null_mut()),
         }
     }
 
-    fn add(&self, t: i32) {
+    pub fn push(&self, elem: T) {
+        let new_tail = Box::into_raw(Box::new(Node { elem, next: None }));
+
+        loop {
+            unsafe {
+                let mut current_tail = self.tail.load(Relaxed);
+                if current_tail.is_null() {
+                    // Tail has nothing -- we need to add a new tail, and make the head point to that
+                    // tail as it is the only element in the queue.
+                    // Possible states we are currently in:
+                    // - There are no elements in the list, and no other threads are interacting with
+                    // the list
+                    // - There are no elements in the list, and other threads are also trying to add an
+                    // element to the list -- hence we CAS
+                    //
+                    // That is, if Tail is null, then we assume there is no other state the queue can
+                    // be in other than empty -- once we succesfully add the new tail, we can safely
+                    // add the new head too
+                    match self
+                        .tail
+                        .compare_exchange(current_tail, new_tail, Acquire, Relaxed)
+                    {
+                        Ok(_) => {
+                            self.head.store(new_tail, Relaxed);
+                            break;
+                        }
+                        Err(e) => {
+                            current_tail = e;
+                        }
+                    }
+                } else {
+                    // Tail has something, so we need to update the old Tail
+                    let old_tail = current_tail;
+                    (*old_tail).next = Some(NonNull::new_unchecked(new_tail));
+
+                    match self
+                        .tail
+                        .compare_exchange(old_tail, new_tail, Acquire, Relaxed)
+                    {
+                        Ok(_) => break,
+                        Err(e) => {
+                            current_tail = e;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn pop(&self) -> Option<T> {
+        let current_head = self.head.load(Relaxed);
         unsafe {
-            let old = self.ptr.load(std::sync::atomic::Ordering::Relaxed);
-            let mut new = Box::new(old.as_ref().unwrap().clone());
-            new.push_back(t);
-            if let Err(e) = self.ptr.compare_exchange(
-                old,
-                Box::into_raw(new),
-                std::sync::atomic::Ordering::Acquire,
-                std::sync::atomic::Ordering::Relaxed,
-            ) {
-                dbg!(Box::from_raw(e));
-                panic!()
+            if current_head.is_null() {
+                None
             } else {
-                //thread::sleep(Duration::from_secs(1));
-                drop(Box::from_raw(old));
+                match self
+                    .tail
+                    .compare_exchange(current_head, null_mut(), Acquire, Relaxed)
+                {
+                    Ok(_) => {
+                        // tail == head, and tail now == null, so need to update head to be null
+                        self.head.store(null_mut(), Relaxed);
+                        Some(Box::from_raw(current_head).elem)
+                    }
+                    Err(_) => {
+                        // tail != head, so head needs to = head.next
+                        self.head
+                            .store((*current_head).next.unwrap().as_ptr(), Relaxed);
+                        Some(Box::from_raw(current_head).elem)
+                    }
+                }
             }
         }
     }
 }
 
-// RCU
-// Large chunk of data that is read/writeable via multiple threads
-// Instead of sharing the data structure, we can save and share an atomic pointer to it.
-// Instead of modifying the structure, with an atomic pointer, we can replace it entirely.
-// RCU (Read,Copy,Update) is the process necessary to replace the data.
-// - Read the pointer
-// - Copy it to a new allocation that can be modified on the acting thread
-// - (Modify) the copied data, to the required state
-// - Update with a Compare-and-exchange operation (only succeeds if no other thread has updated)
-// - (Deallocate) the exchanged data
-
-#[test]
-fn another_test() {
-    let q = std::sync::Arc::new(QueueLock::new());
-    std::thread::scope(|s| {
-        s.spawn(|| {
-            let q = q.clone();
-            q.add(1);
-            q.add(2);
-        });
-    });
-
-    std::thread::scope(|s| {
-        s.spawn(|| {
-            let q = q.clone();
-            for _ in 0..3 {
-                q.add(3);
-            }
-
-            //unsafe {
-            //let c = Box::from_raw(q.ptr.load(std::sync::atomic::Ordering::Relaxed));
-            //dbg!(c.as_ref());
-            //drop(c);
-            //}
-        });
-        s.spawn(|| {
-            let q = q.clone();
-            for _ in 0..3 {
-                q.add(2);
-            }
-            //unsafe {
-            //    dbg!(Box::from_raw(
-            //        q.ptr.load(std::sync::atomic::Ordering::Relaxed)
-            //    ));
-            //}
-        });
-    });
-    std::thread::scope(|s| {
-        s.spawn(|| {
-            let q = q.clone();
-            for _ in 0..3 {
-                q.add(2);
-            }
-            //unsafe {
-            //    dbg!(Box::from_raw(
-            //        q.ptr.load(std::sync::atomic::Ordering::Relaxed)
-            //    ));
-            //}
-        });
-
-        //s.spawn(|| {
-        //    let q = q.clone();
-        //    q.add(3);
-        //});
-    });
-}
-
-#[test]
-fn test() {
-    let q = std::sync::Arc::new(QueueLock::new());
-    std::thread::scope(|_| {
-        let _t = std::thread::spawn(|| {
-            std::thread::park();
-            println!("there")
-        });
-
-        let _s = std::thread::spawn(|| {
-            std::thread::park();
-            println!("helloo");
-        });
-        //q.clone().add(t.thread().clone());
-        //q.clone().add(s.thread().clone());
-    });
-    unsafe {
-        for _t in (*q.ptr.load(std::sync::atomic::Ordering::Relaxed)).iter() {
-            //t.unpark();
-        }
+impl<T> Drop for Queue<T> {
+    fn drop(&mut self) {
+        while self.pop().is_some() {}
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{sync::Arc, thread};
+
+    #[test]
+    fn basics() {
+        let mut list = Queue::new();
+
+        // Check empty list behaves right
+        assert_eq!(list.pop(), None);
+
+        // Populate list
+        list.push(1);
+        list.push(2);
+        list.push(3);
+
+        // Check normal removal
+        assert_eq!(list.pop(), Some(1));
+        assert_eq!(list.pop(), Some(2));
+
+        // Push some more just to make sure nothing's corrupted
+        list.push(4);
+        list.push(5);
+
+        // Check normal removal
+        assert_eq!(list.pop(), Some(3));
+        assert_eq!(list.pop(), Some(4));
+
+        // Check exhaustion
+        assert_eq!(list.pop(), Some(5));
+        assert_eq!(list.pop(), None);
+
+        // Check the exhaustion case fixed the pointer right
+        list.push(6);
+        list.push(7);
+
+        // Check normal removal
+        assert_eq!(list.pop(), Some(6));
+        assert_eq!(list.pop(), Some(7));
+        assert_eq!(list.pop(), None);
+
+        // Check dropping the queue
+        list.push(8);
+        list.push(9);
+        list.push(10);
+        drop(list);
+    }
+
+    #[test]
+    fn push_from_multiple_threads() {
+        loom::model(|| {
+            const NUM_THREADS: usize = 3;
+
+            let list = Arc::new(Queue::new());
+
+            let mut handles = Vec::with_capacity(NUM_THREADS);
+
+            for i in 0..NUM_THREADS {
+                let list = list.clone();
+
+                let handle = thread::spawn(move || {
+                    list.push(thread::current().id());
+                    //assert_ne!(0, list.len());
+                });
+                handles.push(handle);
+            }
+
+            for handle in handles {
+                handle.join().unwrap();
+            }
+
+            //assert_eq!(NUM_THREADS, list.len());
+        });
+    }
+
+    #[test]
+    fn push_and_pop_from_multiple_threads() {
+        loom::model(|| {
+            const NUM_THREADS: usize = 3;
+
+            let list = Arc::new(Queue::new());
+
+            let mut handles = Vec::with_capacity(NUM_THREADS);
+
+            let l = list.clone();
+            let handle = thread::spawn(move || {
+                l.push(thread::current().id());
+            });
+            handles.push(handle);
+
+            let l = list;
+            let handle = thread::spawn(move || {
+                l.pop();
+            });
+            handles.push(handle);
+
+            for handle in handles {
+                handle.join().unwrap();
+            }
+        });
+    }
+}
+
