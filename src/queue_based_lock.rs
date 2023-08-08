@@ -1,6 +1,6 @@
 use crate::sync::atomic::{
     AtomicPtr,
-    Ordering::{Acquire, Relaxed},
+    Ordering::{Acquire, Relaxed, Release},
 };
 use std::ptr::{null_mut, NonNull};
 
@@ -41,7 +41,7 @@ impl<T> Queue<T> {
                     // add the new head too
                     match self
                         .tail
-                        .compare_exchange(current_tail, new_tail, Acquire, Relaxed)
+                        .compare_exchange_weak(current_tail, new_tail, Acquire, Relaxed)
                     {
                         Ok(_) => {
                             self.head.store(new_tail, Relaxed);
@@ -57,7 +57,7 @@ impl<T> Queue<T> {
 
                     match self
                         .tail
-                        .compare_exchange(current_tail, new_tail, Acquire, Relaxed)
+                        .compare_exchange_weak(current_tail, new_tail, Acquire, Relaxed)
                     {
                         Ok(ptr) => {
                             (*ptr).next = Some(NonNull::new_unchecked(new_tail));
@@ -74,30 +74,34 @@ impl<T> Queue<T> {
     }
 
     pub fn pop(&self) -> Option<T> {
-        let current_head = self.head.load(Relaxed);
-        let current_tail = self.tail.load(Relaxed);
+        let mut current_head = self.head.load(Relaxed);
         unsafe {
-            if current_head.is_null() && current_tail.is_null() {
+            if current_head.is_null() {
                 None
-            } else if !current_head.is_null() && !current_tail.is_null() {
-                match self
-                    .tail
-                    .compare_exchange(current_head, null_mut(), Acquire, Relaxed)
-                {
-                    Ok(_) => {
-                        // tail == head, and tail now == null, so need to update head to be null
-                        self.head.store(null_mut(), Relaxed);
-                        Some(Box::from_raw(current_head).elem)
-                    }
-                    Err(_) => {
-                        // tail != head, so head needs to = head.next
-                        self.head
-                            .store((*current_head).next.unwrap().as_ptr(), Relaxed);
-                        Some(Box::from_raw(current_head).elem)
-                    }
-                }
             } else {
-                None
+                match self.head.compare_exchange(
+                    current_head,
+                    (*current_head)
+                        .next
+                        .map(|p| p.as_ptr())
+                        .unwrap_or(null_mut()),
+                    Acquire,
+                    Relaxed,
+                ) {
+                    Ok(old_head) => {
+                        //let old_head = Box::from_raw(old_head);
+                        if (*old_head).next.is_none() {
+                            let _ = self.tail.compare_exchange(
+                                current_head,
+                                null_mut(),
+                                Acquire,
+                                Relaxed,
+                            );
+                        }
+                        Some(Box::from_raw(old_head).elem)
+                    }
+                    Err(_) => None,
+                }
             }
         }
     }
@@ -191,7 +195,30 @@ mod tests {
 
                 for _ in 0..NUM_THREADS {
                     assert!(list.pop().is_some());
-                    //dbg!(list.pop());
+                }
+            });
+        }
+
+        #[test]
+        fn pop() {
+            loom::model(|| {
+                const NUM_THREADS: usize = 2;
+
+                let list = Arc::new(Queue::new());
+                list.push(1);
+
+                let mut handles = Vec::with_capacity(NUM_THREADS);
+
+                for _ in 0..NUM_THREADS {
+                    let list = list.clone();
+                    let handle = thread::spawn(move || {
+                        list.pop();
+                    });
+                    handles.push(handle);
+                }
+
+                for handle in handles {
+                    handle.join().unwrap();
                 }
             });
         }
@@ -202,26 +229,23 @@ mod tests {
                 const NUM_THREADS: usize = 3;
 
                 let list = Arc::new(Queue::new());
+                list.push(thread::current().id());
 
                 let mut handles = Vec::with_capacity(NUM_THREADS);
 
-                let l = list.clone();
-                let handle = thread::spawn(move || {
-                    l.push(thread::current().id());
-                });
-                handles.push(handle);
-
-                let l = list.clone();
-                let handle = thread::spawn(move || {
-                    l.push(thread::current().id());
-                });
-                handles.push(handle);
-
-                let l = list;
-                let handle = thread::spawn(move || {
-                    l.pop();
-                });
-                handles.push(handle);
+                for i in 0..NUM_THREADS {
+                    let list = list.clone();
+                    let handle = if i % 2 != 0 {
+                        thread::spawn(move || {
+                            list.push(thread::current().id());
+                        })
+                    } else {
+                        thread::spawn(move || {
+                            list.pop();
+                        })
+                    };
+                    handles.push(handle);
+                }
 
                 for handle in handles {
                     handle.join().unwrap();
