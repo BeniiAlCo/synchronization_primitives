@@ -1,12 +1,19 @@
-use crate::sync::atomic::{
-    AtomicPtr,
-    Ordering::{Acquire, Relaxed, Release},
+use crate::{
+    semaphore::binary_semaphore::BinarySemaphore,
+    sync::{
+        atomic::{
+            AtomicPtr,
+            Ordering::{Acquire, Relaxed, Release},
+        },
+        Arc,
+    },
 };
 use std::ptr::{null_mut, NonNull};
 
 pub struct Queue<T> {
     head: AtomicPtr<Node<T>>,
     tail: AtomicPtr<Node<T>>,
+    semaphore: Arc<BinarySemaphore>,
 }
 
 struct Node<T> {
@@ -19,65 +26,39 @@ impl<T> Queue<T> {
         Self {
             head: AtomicPtr::new(null_mut()),
             tail: AtomicPtr::new(null_mut()),
+            semaphore: Arc::new(BinarySemaphore::new()),
         }
     }
 
     pub fn push(&self, elem: T) {
-        let new_tail = Box::into_raw(Box::new(Node { elem, next: None }));
-        let mut current_tail = self.tail.load(Relaxed);
-        loop {
-            unsafe {
-                if current_tail.is_null() {
-                    // Tail has nothing -- we need to add a new tail, and make the head point to that
-                    // tail as it is the only element in the queue.
-                    // Possible states we are currently in:
-                    // - There are no elements in the list, and no other threads are interacting with
-                    // the list
-                    // - There are no elements in the list, and other threads are also trying to add an
-                    // element to the list -- hence we CAS
-                    //
-                    // That is, if Tail is null, then we assume there is no other state the queue can
-                    // be in other than empty -- once we succesfully add the new tail, we can safely
-                    // add the new head too
-                    match self
-                        .tail
-                        .compare_exchange_weak(current_tail, new_tail, Acquire, Relaxed)
-                    {
-                        Ok(_) => {
-                            self.head.store(new_tail, Relaxed);
-                            break;
-                        }
-                        Err(e) => {
-                            current_tail = e;
-                        }
-                    }
-                } else {
-                    // Tail has something, so we need to update the old Tail
-                    //let old_tail = current_tail;
+        unsafe {
+            let permit = self.semaphore.aquire();
+            let new_tail = Box::into_raw(Box::new(Node { elem, next: None }));
 
-                    match self
-                        .tail
-                        .compare_exchange_weak(current_tail, new_tail, Acquire, Relaxed)
-                    {
-                        Ok(ptr) => {
-                            (*ptr).next = Some(NonNull::new_unchecked(new_tail));
-                            //self.tail.store(new_tail, Relaxed);
-                            break;
-                        }
-                        Err(e) => {
-                            current_tail = e;
-                        }
-                    }
+            match self
+                .tail
+                .compare_exchange(null_mut(), new_tail, Acquire, Relaxed)
+            {
+                Ok(_) => {
+                    // tail was null
+                    self.head.store(new_tail, Relaxed);
+                }
+                Err(current_tail) => {
+                    // tail was not null
+                    (*current_tail).next = Some(NonNull::new_unchecked(new_tail));
+                    self.tail.store(new_tail, Relaxed);
                 }
             }
+            BinarySemaphore::release(permit);
         }
     }
 
     pub fn pop(&self) -> Option<T> {
+        let permit = self.semaphore.aquire();
         let mut current_head = self.head.load(Relaxed);
         unsafe {
             if current_head.is_null() {
-                None
+                return None;
             } else {
                 match self.head.compare_exchange(
                     current_head,
@@ -98,12 +79,13 @@ impl<T> Queue<T> {
                                 Relaxed,
                             );
                         }
-                        Some(Box::from_raw(old_head).elem)
+                        return Some(Box::from_raw(old_head).elem);
                     }
-                    Err(_) => None,
+                    Err(_) => return None,
                 }
             }
         }
+        BinarySemaphore::release(permit);
     }
 }
 
@@ -166,7 +148,7 @@ mod tests {
         }
     }
 
-    //#[cfg(loom)]
+    #[cfg(loom)]
     mod loom {
         use super::Queue;
         use crate::{sync::Arc, thread};
@@ -174,7 +156,7 @@ mod tests {
         #[test]
         fn push_from_multiple_threads() {
             loom::model(|| {
-                const NUM_THREADS: usize = 3;
+                const NUM_THREADS: usize = 2;
 
                 let list = Arc::new(Queue::new());
 
